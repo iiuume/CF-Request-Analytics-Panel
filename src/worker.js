@@ -1371,8 +1371,9 @@ const INDEX_HTML = `<!doctype html>
     .github-link { width:42px; height:42px; display:inline-grid; place-items:center; border:1px solid var(--line); border-radius:14px; color:var(--text); text-decoration:none; background:rgba(255,255,255,.04); transition:transform .18s ease,border-color .18s ease,background .18s ease; }
     .github-link:hover { transform:translateY(-1px); border-color:var(--accent); background:rgba(94,234,212,.08); }
     .github-link svg { width:22px; height:22px; fill:currentColor; }
+    .top-action { display:inline-flex; align-items:center; justify-content:center; background:#243655; color:var(--text); border:1px solid var(--line); text-decoration:none; border-radius:13px; padding:11px 14px; font:inherit; font-weight:800; line-height:normal; }
     button, input, select, textarea { font:inherit; }
-    button { border:0; border-radius:14px; padding:11px 15px; color:#07101d; background:var(--accent); font-weight:800; cursor:pointer; }
+    button { min-width:256px; border:0; border-radius:14px; padding:11px 15px; color:#07101d; background:var(--accent); font-weight:800; cursor:pointer; }
     button.secondary { background:#243655; color:var(--text); border:1px solid var(--line); }
     button.danger { background:var(--bad); color:#1b0710; }
     button[hidden] { display:none; }
@@ -1385,6 +1386,7 @@ const INDEX_HTML = `<!doctype html>
     .panel { border:1px solid rgba(255,255,255,.09); background:rgba(17,26,47,.84); border-radius:24px; padding:20px; box-shadow:0 24px 70px rgba(0,0,0,.28); overflow:hidden; }
     #chartPanel { min-height:300px; }
     #chartPanel canvas { width:100% !important; min-height:240px; }
+    label { display:grid; gap:8px; }
     .card small, label, .muted { color:var(--muted); }
     .split { display:grid; grid-template-columns: 1.45fr .95fr; gap:16px; }
     table { width:100%; border-collapse:collapse; table-layout:fixed; }
@@ -1411,6 +1413,7 @@ const INDEX_HTML = `<!doctype html>
     .modal-card code { display:block; margin:12px 0; padding:12px; border-radius:14px; background:#0d172b; color:var(--accent); overflow-wrap:anywhere; }
     .admin-only { display:none !important; }
     body.admin .admin-only { display:revert !important; }
+    body.admin .top-action.admin-only { display:inline-flex !important; }
     .privacy-hidden { display:none !important; }
     .overlay-panel { display:none; }
     .overlay-panel.open { display:grid; }
@@ -1422,7 +1425,7 @@ const INDEX_HTML = `<!doctype html>
 <body>
   <header>
     <div><h1>CF Request Analytics</h1><div class="muted">多账号 HTTP 请求分析、Top IP、趋势折线与 Workers AI 风险判断</div></div>
-    <div class="row"><a class="github-link" href="https://github.com/PoemMisty/CF-Request-Analytics-Panel" target="_blank" rel="noopener" aria-label="GitHub"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .5a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.03c-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.2.08 1.84 1.24 1.84 1.24 1.07 1.83 2.81 1.3 3.5.99.11-.78.42-1.3.76-1.6-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.12-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.23A11.45 11.45 0 0 1 12 5.8c1.02 0 2.04.14 3 .4 2.29-1.55 3.3-1.23 3.3-1.23.66 1.66.24 2.88.12 3.18.77.84 1.24 1.91 1.24 3.22 0 4.61-2.81 5.63-5.49 5.93.43.37.82 1.1.82 2.22v3.29c0 .32.22.7.83.58A12 12 0 0 0 12 .5Z"/></svg></a><a id="loginEntry" href="/login" class="secondary" style="border:1px solid var(--line);border-radius:14px;padding:11px 15px;text-decoration:none">管理员登录</a><a id="adminEntry" href="/admin" class="admin-only" style="border:1px solid var(--line);border-radius:14px;padding:11px 15px;text-decoration:none">后台管理</a></div>
+    <div class="row"><a class="github-link" href="https://github.com/PoemMisty/CF-Request-Analytics-Panel" target="_blank" rel="noopener" aria-label="GitHub"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .5a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.03c-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.2.08 1.84 1.24 1.84 1.24 1.07 1.83 2.81 1.3 3.5.99.11-.78.42-1.3.76-1.6-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.12-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.23A11.45 11.45 0 0 1 12 5.8c1.02 0 2.04.14 3 .4 2.29-1.55 3.3-1.23 3.3-1.23.66 1.66.24 2.88.12 3.18.77.84 1.24 1.91 1.24 3.22 0 4.61-2.81 5.63-5.49 5.93.43.37.82 1.1.82 2.22v3.29c0 .32.22.7.83.58A12 12 0 0 0 12 .5Z"/></svg></a><a id="loginEntry" href="/login" class="top-action">管理员登录</a><a id="adminEntry" href="/admin" class="admin-only top-action">后台管理</a></div>
   </header>
   <main>
     <section class="panel grid toolbar">
@@ -1535,8 +1538,9 @@ const ADMIN_PANEL_HTML = `<!doctype html>
     input, textarea { width:100%; border:1px solid var(--line); background:#0d172b; color:var(--text); padding:11px; }
     textarea { min-height:120px; resize:vertical; }
     input[type=checkbox] { width:18px; height:18px; min-width:18px; margin:0; accent-color:var(--accent); }
-    button { border:0; background:var(--accent); color:#07101d; font-weight:800; padding:11px 14px; cursor:pointer; }
-    .secondary { background:#243655; color:var(--text); border:1px solid var(--line); text-decoration:none; border-radius:13px; padding:11px 14px; }
+    button { min-width:256px; border:0; background:var(--accent); color:#07101d; font-weight:800; padding:11px 14px; cursor:pointer; }
+    header .row button { min-width:auto; }
+    .secondary { display:inline-flex; align-items:center; justify-content:center; background:#243655; color:var(--text); border:1px solid var(--line); text-decoration:none; border-radius:13px; padding:11px 14px; font:inherit; font-weight:800; line-height:normal; }
     .danger { background:var(--bad); }
     .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }
     .check { display:flex; align-items:center; gap:10px; line-height:1.5; color:var(--muted); }
