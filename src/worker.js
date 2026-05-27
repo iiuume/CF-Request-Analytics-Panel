@@ -161,8 +161,9 @@ async function analyticsRoute(request, env) {
   const results = await Promise.all(analyzableAccounts.map((account) => loadAccountAnalytics(account, hours, host)));
   const summary = mergeAnalytics(results, hours);
   const projectMetrics = projectName ? await loadWorkerProjectMetrics(usableAccounts, projectName, hours) : null;
+  const workerMetrics = projectMetrics || await loadWorkerAccountMetrics(usableAccounts, hours);
   const usage = projectMetrics ? projectUsageSummary(await loadUsageSummary(usableAccounts), projectMetrics) : await loadUsageSummary(usableAccounts);
-  const body = { generatedAt: beijingNow(), hours, host, projectName, zone: zoneId, accounts: results.map(stripSecrets), summary: withBeijingTimeline(summary), usage, projectMetrics, analyticsAvailable: analyzableAccounts.length > 0, privacy };
+  const body = { generatedAt: beijingNow(), hours, host, projectName, zone: zoneId, accounts: results.map(stripSecrets), summary: withBeijingTimeline(summary), usage, projectMetrics, workerMetrics, analyticsAvailable: analyzableAccounts.length > 0, privacy };
   return json(privateView ? body : redactForPublic(body, privacy));
 }
 
@@ -301,6 +302,36 @@ async function queryAccountUsage(account, start, end) {
 
 function sumRequests(rows) {
   return (rows || []).reduce((total, row) => total + Number(row?.sum?.requests || 0), 0);
+}
+
+async function loadWorkerAccountMetrics(accounts, hours) {
+  const { start, end } = timeRange(hours);
+  const configured = accounts.filter((account) => account.accountId);
+  const rows = await Promise.all(configured.map((account) => queryWorkerAccountMetrics(account, start, end).catch((error) => ({ accountId: account.id, name: account.name, totalRequests: 0, timeline: [], fourHourBuckets: [], error: error.message }))));
+  const timeline = mergeProjectTimeline(rows);
+  return {
+    projectName: "",
+    totalRequests: timeline.reduce((sum, point) => sum + Number(point.count || 0), 0),
+    matched: timeline.some((point) => Number(point.count || 0) > 0),
+    timeline,
+    fourHourBuckets: mergeProjectBuckets(rows),
+    accounts: rows,
+    note: "未指定 Service 名称，按当前筛选账号汇总 Workers 请求折线。",
+  };
+}
+
+async function queryWorkerAccountMetrics(account, start, end) {
+  const query = `query WorkerAccountMetrics($accountTag: string, $datetimeStart: string, $datetimeEnd: string) { viewer { accounts(filter: { accountTag: $accountTag }) { workersInvocationsAdaptive(limit: 10000, filter: { datetime_geq: $datetimeStart, datetime_leq: $datetimeEnd }) { sum { requests errors subrequests } dimensions { datetime status } } } } }`;
+  const payload = await cfGraphql(account.token, query, { accountTag: account.accountId, datetimeStart: start, datetimeEnd: end });
+  const rows = payload.data?.viewer?.accounts?.[0]?.workersInvocationsAdaptive || [];
+  const timeline = buildProjectTimeline(rows, start, end);
+  return {
+    accountId: account.id,
+    name: account.name,
+    totalRequests: timeline.reduce((sum, point) => sum + point.count, 0),
+    timeline,
+    fourHourBuckets: buildProjectFourHourBuckets(timeline),
+  };
 }
 
 async function loadWorkerProjectMetrics(accounts, projectName, hours) {
@@ -789,7 +820,7 @@ ${verboseRule}
 低风险输出规则：
 - 当判断为正常或无异常时，不要猜测复杂原因，不要给过度建议，不要写节点泄露、疑似泄露、被他人使用。
 - 可能原因只允许从以下短语选择：客户端探测/保活、订阅刷新、临时测速、爬虫扫描噪声、普通请求噪声、固定出口自用。
-- 建议只允许从以下短语选择：无需处理，继续常规观察、维持现状、观察后续是否持续、如为你的出口 IP，则属正常。
+- 建议只允许从以下短语选择：无需处理，继续常规观察、维持现状、观察后续是否持续、如最大 IP 是你的出口，则属正常、如高峰对应你的上网时段，则属正常。
 
 风险等级：
 - 当前请求正常：低。
@@ -810,6 +841,8 @@ ${outputTemplate}
 - 依据最多 3 条，每条不超过 28 个汉字；必须提到 6 段/4 小时分段趋势。
 - 可能原因最多 2 条，每条不超过 22 个汉字。
 - 建议最多 2 条，每条不超过 24 个汉字。
+- 如果最大 IP 占比较大，输出的“建议”中必须包含：如最大 IP 是你的出口，则属正常。
+- 如果存在明显高峰期且平峰期请求较低，输出的“建议”中必须包含：如高峰对应你的上网时段，则属正常。
 - 如果 verbose 为 true，按“完整数据”各小标题复述输入关键字段；如果 verbose 为 false，不输出完整数据，但仍必须完整查看全部 6 段每 4 小时数据。
 
 数据：${compact}`;
@@ -1197,6 +1230,8 @@ function redactForPublic(body, privacy) {
   const safe = structuredClone(body);
   if (!privacy.publicTimeline) {
     safe.summary.timeline = [];
+    if (safe.workerMetrics) safe.workerMetrics.timeline = [];
+    if (safe.projectMetrics) safe.projectMetrics.timeline = [];
     for (const account of safe.accounts) {
       account.totals.timeline = [];
       for (const zone of account.zones || []) zone.timeline = [];
@@ -1219,6 +1254,8 @@ function redactForPublic(body, privacy) {
   if (!privacy.publicFilters) {
     safe.accounts = safe.accounts.map((account) => ({ id: account.id, name: account.name, totals: { totalRequests: account.totals.totalRequests, totalBytes: account.totals.totalBytes } }));
     safe.host = "";
+    if (safe.workerMetrics) safe.workerMetrics.accounts = [];
+    if (safe.projectMetrics) safe.projectMetrics.accounts = [];
   }
   return safe;
 }
@@ -1385,8 +1422,11 @@ const INDEX_HTML = `<!doctype html>
     .toolbar button { grid-column:1 / -1; justify-self:end; }
     .cards { grid-template-columns: repeat(3, minmax(0,1fr)); }
     .panel { border:1px solid rgba(255,255,255,.09); background:rgba(17,26,47,.84); border-radius:24px; padding:20px; box-shadow:0 24px 70px rgba(0,0,0,.28); overflow:hidden; }
-    #chartPanel { min-height:300px; }
-    #chartPanel canvas { width:100% !important; min-height:240px; }
+    #chartPanel, #trafficChartPanel { min-height:300px; }
+    .chart-wrap { position:relative; height:clamp(260px, 32vh, 420px); width:100%; }
+    .chart-wrap canvas { width:100% !important; height:100% !important; display:block; }
+    .chart-head { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-bottom:12px; }
+    .chart-head label { min-width:220px; }
     label { display:grid; gap:8px; }
     .card small, label, .muted { color:var(--muted); }
     .split { display:grid; grid-template-columns: 1.45fr .95fr; gap:16px; }
@@ -1443,17 +1483,27 @@ const INDEX_HTML = `<!doctype html>
       <div id="analysisBlocked" class="notice muted privacy-hidden">当前账号未配置区域 ID，只能显示 Workers/Pages 用量进度，无法展示域名请求明细或 AI 分析。</div>
     </section>
     <section class="panel grid cards">
-      <div class="usage-card"><div class="top"><span>总请求数</span></div><strong id="totalRequests">-</strong><small>当前筛选范围</small></div>
-      <div class="usage-card"><div class="top"><span>边缘响应流量</span></div><strong id="totalBytes">-</strong><small>当前筛选范围</small></div>
-      <div class="usage-card"><div class="top"><span>当前范围</span></div><strong id="rangeText">-</strong><small>北京时间 GMT+8</small></div>
+      <div class="usage-card"><div class="top"><span>总请求数</span></div><strong id="totalRequests">-</strong><small id="requestScopeText">-</small></div>
+      <div class="usage-card"><div class="top"><span>边缘响应流量</span></div><strong id="totalBytes">-</strong><small id="trafficScopeText">-</small></div>
+      <div class="usage-card"><div class="top"><span>当前时间范围</span></div><strong id="rangeText">-</strong><small>北京时间 GMT+8</small></div>
     </section>
     <section class="panel grid usage-bars">
-      <div class="usage-card"><div class="top"><span>Workers 请求</span><span id="workersPct">-</span></div><div class="bar"><span id="workersBar"></span></div><strong id="workersUsage">-</strong><small>占共享免费额度</small></div>
-      <div class="usage-card"><div class="top"><span>Pages 请求</span><span id="pagesPct">-</span></div><div class="bar"><span id="pagesBar"></span></div><strong id="pagesUsage">-</strong><small>占共享免费额度</small></div>
+      <div class="usage-card"><div class="top"><span>Workers 请求</span><span id="workersPct">-</span></div><div class="bar"><span id="workersBar"></span></div><strong id="workersUsage">-</strong><small id="workersScopeText">-</small></div>
+      <div class="usage-card"><div class="top"><span>Pages 请求</span><span id="pagesPct">-</span></div><div class="bar"><span id="pagesBar"></span></div><strong id="pagesUsage">-</strong><small id="pagesScopeText">-</small></div>
       <div class="usage-card"><div class="top"><span>共享额度总请求</span><span id="totalUsagePct">-</span></div><div class="bar"><span id="totalUsageBar"></span></div><strong id="totalUsage">-</strong><small>Workers + Pages 合计</small></div>
       <div id="usageNote" class="muted" style="grid-column:1/-1;white-space:pre-wrap"></div>
     </section>
-    <section class="panel" id="chartPanel"><canvas id="lineChart" height="130"></canvas><div id="chartBlocked" class="muted privacy-hidden">折线图涉及访问时间分布，管理员未开放未登录展示。</div></section>
+    <section class="panel" id="chartPanel">
+      <div class="chart-head"><h3 id="requestChartTitle">请求数折线</h3><label>数据源<select id="requestChartSource"><option value="http">HTTP 请求</option><option value="worker">Worker 请求</option></select></label></div>
+      <div class="chart-wrap"><canvas id="lineChart"></canvas></div>
+      <div id="requestChartNote" class="muted"></div>
+      <div id="chartBlocked" class="muted privacy-hidden">折线图涉及访问时间分布，管理员未开放未登录展示。</div>
+    </section>
+    <section class="panel" id="trafficChartPanel">
+      <div class="chart-head"><h3 id="trafficChartTitle">流量折线</h3></div>
+      <div class="chart-wrap"><canvas id="trafficChart"></canvas></div>
+      <div id="trafficChartBlocked" class="muted privacy-hidden">流量折线涉及访问时间分布，管理员未开放未登录展示。</div>
+    </section>
     <section class="split">
       <div class="panel"><h3>Top IPs</h3><div id="ipBlocked" class="muted privacy-hidden">详细 IP 涉及隐私，管理员未开放未登录展示。</div><table id="ipTableWrap"><thead><tr><th>IP</th><th>国家/地区</th><th>请求</th></tr></thead><tbody id="ipTable"></tbody></table></div>
       <div class="panel"><h3>Top Hosts</h3><div id="hostBlocked" class="muted privacy-hidden">主机明细涉及隐私，管理员未开放未登录展示。</div><table id="hostTableWrap"><thead><tr><th>Host</th><th>请求</th></tr></thead><tbody id="hostTable"></tbody></table></div>
@@ -1474,6 +1524,11 @@ const INDEX_HTML = `<!doctype html>
   <script>
     const $ = (id) => document.getElementById(id);
     let chart;
+    let trafficChart;
+    let currentSummary = emptyDashboardSummary();
+    let currentProjectMetrics = null;
+    let currentWorkerMetrics = null;
+    let currentAvailable = true;
     let accountCache = [];
     let pendingAiHost = "";
     const NO_ACCOUNT_MESSAGE = "当前还没有账号配置。请先登录后台添加 Cloudflare 账号后再查看分析或使用 AI 分析。";
@@ -1487,31 +1542,37 @@ const INDEX_HTML = `<!doctype html>
     }
     function fmt(n) { return Intl.NumberFormat("zh-CN").format(n || 0); }
     function bytes(n) { if (!n) return "0 B"; const units=["B","KB","MB","GB","TB"]; let i=0,v=n; while(v>=1024&&i<units.length-1){v/=1024;i++;} return v.toFixed(i?2:0)+" "+units[i]; }
+    function chartBytes(n) { if (!n) return "0 B"; const units=["B","KB","MB","GB","TB"]; let i=0,v=Math.abs(Number(n)||0); while(v>=999.5&&i<units.length-1){v/=1024;i++;} const fixed = v >= 100 ? 0 : v >= 10 ? 1 : 2; return (n < 0 ? "-" : "") + v.toFixed(fixed).replace(/\.0+$/, "").replace(/(\.\d*[1-9])0+$/, "$1") + " " + units[i]; }
     async function init() { session = await api("/api/session"); document.body.classList.toggle("admin", session.admin); $("loginEntry").classList.toggle("privacy-hidden", session.admin); applyPrivacy(session.privacy); if (session.admin) await loadAccounts(); await refresh(); }
-    function applyPrivacy(privacy) { const canFilter = session.admin || privacy.publicFilters; const canTimeline = session.admin || privacy.publicTimeline; const canTopIPs = session.admin || privacy.publicTopIPs; const canTopHosts = session.admin || privacy.publicTopHosts; $("aiPanel").classList.toggle("privacy-hidden", Boolean(privacy.hideAiPanel)); $("accountFilter").classList.toggle("privacy-hidden", !canFilter); $("zoneFilter").classList.toggle("privacy-hidden", !canFilter); $("hostFilter").classList.toggle("privacy-hidden", !canFilter); $("projectFilter").classList.toggle("privacy-hidden", !canFilter); $("chartBlocked").classList.toggle("privacy-hidden", canTimeline); $("lineChart").classList.toggle("privacy-hidden", !canTimeline); $("ipBlocked").classList.toggle("privacy-hidden", canTopIPs); $("ipTableWrap").classList.toggle("privacy-hidden", !canTopIPs); $("hostBlocked").classList.toggle("privacy-hidden", canTopHosts); $("hostTableWrap").classList.toggle("privacy-hidden", !canTopHosts); }
+    function applyPrivacy(privacy) { const canFilter = session.admin || privacy.publicFilters; const canTimeline = session.admin || privacy.publicTimeline; const canTopIPs = session.admin || privacy.publicTopIPs; const canTopHosts = session.admin || privacy.publicTopHosts; $("aiPanel").classList.toggle("privacy-hidden", Boolean(privacy.hideAiPanel)); $("accountFilter").classList.toggle("privacy-hidden", !canFilter); $("zoneFilter").classList.toggle("privacy-hidden", !canFilter); $("hostFilter").classList.toggle("privacy-hidden", !canFilter); $("projectFilter").classList.toggle("privacy-hidden", !canFilter); $("chartBlocked").classList.toggle("privacy-hidden", canTimeline); $("trafficChartBlocked").classList.toggle("privacy-hidden", canTimeline); $("lineChart").classList.toggle("privacy-hidden", !canTimeline); $("trafficChart").classList.toggle("privacy-hidden", !canTimeline); $("ipBlocked").classList.toggle("privacy-hidden", canTopIPs); $("ipTableWrap").classList.toggle("privacy-hidden", !canTopIPs); $("hostBlocked").classList.toggle("privacy-hidden", canTopHosts); $("hostTableWrap").classList.toggle("privacy-hidden", !canTopHosts); }
     function escapeHtml(value) { return String(value || "").replace(/[&<>"]/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[ch])); }
     function inlineMarkdown(value) { return escapeHtml(value).replace(new RegExp("\\\\*\\\\*([^*]+)\\\\*\\\\*", "g"), "<strong>$1</strong>"); }
     function renderMarkdown(text) { const lines = String(text || "").split(String.fromCharCode(10)); let html = ""; let list = ""; const closeList = () => { if (list) { html += "</" + list + ">"; list = ""; } }; const sectionTitle = /^(结论|风险等级|依据|可能原因|建议|完整数据)$/; for (const raw of lines) { const line = raw.trim(); if (!line) { closeList(); continue; } if (line.startsWith("#### ")) { closeList(); html += "<h4>" + inlineMarkdown(line.slice(5)) + "</h4>"; continue; } if (line.startsWith("### ")) { closeList(); html += "<h3>" + inlineMarkdown(line.slice(4)) + "</h3>"; continue; } if (sectionTitle.test(line)) { closeList(); html += "<h3>" + inlineMarkdown(line) + "</h3>"; continue; } const ordered = line.match(/^\d+[.、]\s*(.+)$/); if (ordered) { if (list !== "ol") { closeList(); html += "<ol>"; list = "ol"; } html += "<li>" + inlineMarkdown(ordered[1]) + "</li>"; continue; } if (line.startsWith("- ")) { if (list !== "ul") { closeList(); html += "<ul>"; list = "ul"; } html += "<li>" + inlineMarkdown(line.slice(2)) + "</li>"; continue; } closeList(); html += "<p>" + inlineMarkdown(line) + "</p>"; } closeList(); return html; }
     async function loadAccounts() { const data = await api("/api/accounts").catch(() => ({accounts:[]})); accountCache = data.accounts || []; $("accountSelect").innerHTML = '<option value="all">全部账号汇总</option>' + accountCache.map(a => '<option value="' + escapeHtml(a.id) + '">' + escapeHtml(a.name) + '</option>').join(""); loadZones(); }
     function loadZones() { const accountId = $("accountSelect").value; const accounts = accountId === "all" ? accountCache : accountCache.filter(a => a.id === accountId); const zones = accounts.flatMap(a => (a.zones || []).map(z => ({ id:z.id, name:(accountId === "all" ? a.name + " / " : "") + (z.name || "未命名区域") }))); $("zoneSelect").innerHTML = '<option value="all">全部区域汇总</option>' + zones.map(z => '<option value="' + escapeHtml(z.id) + '">' + escapeHtml(z.name) + '</option>').join(""); }
     function emptyDashboardSummary() { return { totalRequests:0, totalBytes:0, timeline:[], topIPs:[], topHosts:[] }; }
-    async function refresh() { const q = new URLSearchParams({ account: $("accountSelect").value, zone: $("zoneSelect").value, hours: $("rangeSelect").value, host: $("hostInput").value.trim(), projectName: $("projectInput").value.trim() }); try { const data = await api("/api/analytics?" + q); render(data.summary, data.hours, data.usage, data.analyticsAvailable !== false, data.projectMetrics); } catch (err) { if (err.code === "no_account") { render(emptyDashboardSummary(), $("rangeSelect").value, { workers:0, pages:0, total:0, limit:0 }, false, null); $("analysisBlocked").textContent = err.message; return; } throw err; } }
+    function selectedScopeText() { const account = $("accountSelect").options[$("accountSelect").selectedIndex]?.textContent || "全部账号汇总"; const zone = $("zoneSelect").options[$("zoneSelect").selectedIndex]?.textContent || "全部区域汇总"; return account + " / " + zone; }
+    async function refresh() { const q = new URLSearchParams({ account: $("accountSelect").value, zone: $("zoneSelect").value, hours: $("rangeSelect").value, host: $("hostInput").value.trim(), projectName: $("projectInput").value.trim() }); try { const data = await api("/api/analytics?" + q); render(data.summary, data.hours, data.usage, data.analyticsAvailable !== false, data.projectMetrics, data.workerMetrics); } catch (err) { if (err.code === "no_account") { render(emptyDashboardSummary(), $("rangeSelect").value, { workers:0, pages:0, total:0, limit:0 }, false, null, null); $("analysisBlocked").textContent = err.message; return; } throw err; } }
     function shortBeijingTime(value) { const text = String(value || "").replace("T", " "); const match = text.match(/^(?:[0-9]{4}-)?([0-9]{2}-[0-9]{2})[ ]+([0-9]{2}:[0-9]{2})/); return match ? match[1] + " " + match[2] : text.replace(/^[0-9]{4}-/, "").replace(/:[0-9]{2}(?:[ ]+GMT[+]8|Z)?$/, ""); }
-    function render(s, hours, usage, available = true, projectMetrics = null) { $("totalRequests").textContent = fmt(projectMetrics?.totalRequests ?? s.totalRequests); $("totalBytes").textContent = bytes(s.totalBytes); $("rangeText").textContent = hours + "h"; renderUsage(usage, projectMetrics); $("analysisBlocked").classList.toggle("privacy-hidden", available); $("aiBtn").disabled = !available; $("chartPanel").classList.toggle("blocked", !available); $("ipTableWrap").classList.toggle("blocked", !available); $("hostTableWrap").classList.toggle("blocked", !available); $("ipTable").innerHTML = s.topIPs.map(x => '<tr><td>' + escapeHtml(x.dimensions.clientIP) + '</td><td>' + escapeHtml(x.dimensions.clientCountryName||"-") + '</td><td>' + fmt(x.count) + '</td></tr>').join(""); $("hostTable").innerHTML = s.topHosts.map(x => '<tr><td>' + escapeHtml(x.dimensions.clientRequestHTTPHost) + '</td><td>' + fmt(x.count) + '</td></tr>').join(""); if(chart) chart.destroy(); const series = projectMetrics?.timeline?.length ? projectMetrics.timeline : s.timeline; if (!available || !series.length) return; const labels=series.map(x=>shortBeijingTime(x.time)); const counts=series.map(x=>x.count); chart = new Chart($("lineChart"), { type:"line", data:{ labels, datasets:[{ label:projectMetrics ? "项目 Workers 请求数（北京时间）" : "请求数（北京时间）", data:counts, borderColor:"#5eead4", backgroundColor:"rgba(94,234,212,.16)", tension:.28, fill:true }] }, options:{ responsive:true, maintainAspectRatio:false, plugins:{ legend:{ labels:{ color:"#dbeafe" } } }, scales:{ x:{ ticks:{ color:"#8ea3c3", maxTicksLimit:8 }, grid:{ color:"rgba(255,255,255,.06)" } }, y:{ ticks:{ color:"#8ea3c3" }, grid:{ color:"rgba(255,255,255,.06)" } } } } }); setTimeout(() => chart && chart.resize(), 60); }
+    function render(s, hours, usage, available = true, projectMetrics = null, workerMetrics = null) { currentSummary = s; currentProjectMetrics = projectMetrics; currentWorkerMetrics = workerMetrics; currentAvailable = available; const scope = selectedScopeText(); if (projectMetrics?.matched) $("requestChartSource").value = "worker"; $("requestScopeText").textContent = scope; $("trafficScopeText").textContent = scope; $("workersScopeText").textContent = scope; $("pagesScopeText").textContent = scope; $("totalRequests").textContent = fmt(projectMetrics?.totalRequests ?? s.totalRequests); $("totalBytes").textContent = bytes(s.totalBytes); $("rangeText").textContent = hours + "h"; renderUsage(usage, projectMetrics); $("analysisBlocked").classList.toggle("privacy-hidden", available); $("aiBtn").disabled = !available; $("chartPanel").classList.toggle("blocked", !available); $("trafficChartPanel").classList.toggle("blocked", !available); $("ipTableWrap").classList.toggle("blocked", !available); $("hostTableWrap").classList.toggle("blocked", !available); $("ipTable").innerHTML = s.topIPs.map(x => '<tr><td>' + escapeHtml(x.dimensions.clientIP) + '</td><td>' + escapeHtml(x.dimensions.clientCountryName||"-") + '</td><td>' + fmt(x.count) + '</td></tr>').join(""); $("hostTable").innerHTML = s.topHosts.map(x => '<tr><td>' + escapeHtml(x.dimensions.clientRequestHTTPHost) + '</td><td>' + fmt(x.count) + '</td></tr>').join(""); renderCharts(); }
+    function chartOptions(formatter = fmt) { return { responsive:true, maintainAspectRatio:false, plugins:{ legend:{ labels:{ color:"#dbeafe" } }, tooltip:{ callbacks:{ label:(ctx) => ctx.dataset.label + "：" + formatter(ctx.parsed.y) } } }, scales:{ x:{ ticks:{ color:"#8ea3c3", maxTicksLimit:8 }, grid:{ color:"rgba(255,255,255,.06)" } }, y:{ ticks:{ color:"#8ea3c3", callback:(value) => formatter(value) }, grid:{ color:"rgba(255,255,255,.06)" } } } }; }
+    function renderLine(target, series, valueKey, label, color, formatter = fmt) { const labels = series.map(x => shortBeijingTime(x.time)); const values = series.map(x => Number(x[valueKey] || 0)); return new Chart($(target), { type:"line", data:{ labels, datasets:[{ label, data:values, borderColor:color, backgroundColor:color === "#5eead4" ? "rgba(94,234,212,.16)" : "rgba(96,165,250,.14)", tension:.28, fill:true }] }, options:chartOptions(formatter) }); }
+    function renderCharts() { if (chart) chart.destroy(); if (trafficChart) trafficChart.destroy(); $("requestChartNote").textContent = ""; if (!currentAvailable) return; const requestSource = $("requestChartSource").value; if (requestSource === "worker") { const series = currentWorkerMetrics?.timeline || []; $("requestChartTitle").textContent = currentProjectMetrics ? "请求数折线：项目 Worker 请求" : "请求数折线：Worker 请求"; if (series.length) chart = renderLine("lineChart", series, "count", currentProjectMetrics ? "项目 Worker 请求数（北京时间）" : "Worker 请求数（北京时间）", "#5eead4", fmt); else $("requestChartNote").textContent = "当前账号缺少 Account ID 或暂无 Worker 请求数据。"; } else { $("requestChartTitle").textContent = "请求数折线：HTTP 请求"; if (currentSummary.timeline?.length) chart = renderLine("lineChart", currentSummary.timeline, "count", "HTTP 请求数（北京时间）", "#5eead4", fmt); } $("trafficChartTitle").textContent = "流量折线：HTTP 流量"; if (currentSummary.timeline?.length) trafficChart = renderLine("trafficChart", currentSummary.timeline, "bytes", "HTTP 流量（北京时间）", "#60a5fa", chartBytes); setTimeout(() => { if (chart) chart.resize(); if (trafficChart) trafficChart.resize(); }, 60); }
     function renderUsage(u, projectMetrics = null) { const limit = u?.limit || 0; setUsage("workers", u?.workers || 0, limit, false); setUsage("pages", u?.pages || 0, limit, false); setUsage("totalUsage", u?.total || 0, limit, true); const lines = [u?.missingAccounts ? "· 免费额度：Workers 和 Pages 共享同一免费请求额度；另有 " + u.missingAccounts + " 个账号未配置 Account ID，无法计入额度进度。" : "· 免费额度：Workers 和 Pages 共享同一免费请求额度；页面时间均按北京时间 GMT+8 展示；额度统计按 Cloudflare 当日接口返回口径计算，每个已配置 Account ID 的账号共享 100000 请求。"]; if (projectMetrics) { lines.push(projectMetrics.matched ? "· 项目筛选：统计卡、趋势图和 AI 分析均按当前选中账号与指定 Service 统计；Pages 计为 0。" : "· 项目筛选：已按当前选中账号与指定 Service 统计；当前时间范围内项目级请求为 0。"); lines.push("· HTTP 明细：Top IP / Top Host 和边缘响应流量仍来自当前域名 HTTP 明细。"); } $("usageNote").textContent = lines.join(String.fromCharCode(10)); }
     function setUsage(prefix, value, limit, showLimit) { const pct = limit ? Math.min(100, value / limit * 100) : 0; $(prefix + "Bar").style.width = pct.toFixed(1) + "%"; $(prefix + "Pct").textContent = limit ? pct.toFixed(1) + "%" : "未配置"; $(prefix === "totalUsage" ? "totalUsage" : prefix + "Usage").textContent = limit ? (showLimit ? fmt(value) + " / " + fmt(limit) : fmt(value) + " 次") : "未配置 Account ID"; }
     $("refreshBtn").onclick = refresh;
+    $("requestChartSource").onchange = renderCharts;
     $("accountSelect").onchange = () => { loadZones(); refresh(); };
     $("zoneSelect").onchange = refresh;
     function openAiConfirm(host) { pendingAiHost = host; const accountText = $("accountSelect").options[$("accountSelect").selectedIndex]?.textContent || ""; const zoneText = $("zoneSelect").options[$("zoneSelect").selectedIndex]?.textContent || "全部区域汇总"; const projectName = $("projectInput").value.trim(); $("aiConfirmAccount").textContent = accountText; $("aiConfirmZone").textContent = zoneText; $("aiConfirmHost").textContent = host; $("aiConfirmProject").textContent = projectName; $("aiConfirmMask").classList.add("open"); }
     function closeAiConfirm() { $("aiConfirmMask").classList.remove("open"); pendingAiHost = ""; }
-    async function runAiAnalysis(host) { const btn = $("aiBtn"); const projectName = $("projectInput").value.trim(); btn.disabled = true; btn.textContent = "分析中..."; $("aiResult").textContent = "正在校验服务名 / 项目名数据..."; try { const q = new URLSearchParams({ account: $("accountSelect").value, zone: $("zoneSelect").value, hours: "24", host, projectName }); const checked = await api("/api/analytics?" + q); render(checked.summary, checked.hours, checked.usage, checked.analyticsAvailable !== false, checked.projectMetrics); if (!checked.projectMetrics || !checked.projectMetrics.matched) throw new Error("服务名 / 项目名参数错误，无法成功获取该服务的项目级 Workers metrics 数据。"); $("aiResult").textContent = "AI 正在分析指定服务的 24 小时数据..."; const data = await api("/api/ai/analyze", { method:"POST", body: JSON.stringify({ account: $("accountSelect").value, zone: $("zoneSelect").value, host, projectName }) }); $("aiResult").innerHTML = renderMarkdown(data.analysis); } catch (err) { $("aiResult").textContent = err.message; } finally { btn.disabled = false; btn.textContent = "AI 分析 24h"; } }
+    async function runAiAnalysis(host) { const btn = $("aiBtn"); const projectName = $("projectInput").value.trim(); btn.disabled = true; btn.textContent = "分析中..."; $("aiResult").textContent = "正在校验服务名 / 项目名数据..."; try { const q = new URLSearchParams({ account: $("accountSelect").value, zone: $("zoneSelect").value, hours: "24", host, projectName }); const checked = await api("/api/analytics?" + q); render(checked.summary, checked.hours, checked.usage, checked.analyticsAvailable !== false, checked.projectMetrics, checked.workerMetrics); if (!checked.projectMetrics || !checked.projectMetrics.matched) throw new Error("服务名 / 项目名参数错误，无法成功获取该服务的项目级 Workers metrics 数据。"); $("aiResult").textContent = "AI 正在分析指定服务的 24 小时数据..."; const data = await api("/api/ai/analyze", { method:"POST", body: JSON.stringify({ account: $("accountSelect").value, zone: $("zoneSelect").value, host, projectName }) }); $("aiResult").innerHTML = renderMarkdown(data.analysis); } catch (err) { $("aiResult").textContent = err.message; } finally { btn.disabled = false; btn.textContent = "AI 分析 24h"; } }
     $("aiBtn").onclick = () => { const host = $("hostInput").value.trim(); const projectName = $("projectInput").value.trim(); if (!session.aiAvailable) { $("aiResult").textContent = "当前 Pages 项目未绑定 Workers AI，请根据仓库 README 在 Functions 设置中添加 AI 绑定后重新部署。"; return; } if (!accountCache.length) { $("aiResult").textContent = NO_ACCOUNT_MESSAGE; return; } if ($("accountSelect").value === "all") { $("aiResult").textContent = "请先选择一个具体账号，再进行 AI 盗用风险分析。"; return; } if (!host) { $("aiResult").textContent = "请先输入主机名，再基于筛选后的数据进行 AI 盗用风险分析。"; return; } if (!projectName) { $("aiResult").textContent = "AI 分析必须输入服务名 / 项目名参数。"; return; } openAiConfirm(host); };
     $("aiConfirmNo").onclick = closeAiConfirm;
     $("aiConfirmMask").onclick = (event) => { if (event.target === $("aiConfirmMask")) closeAiConfirm(); };
     $("aiConfirmYes").onclick = async () => { const host = pendingAiHost; closeAiConfirm(); if (host) await runAiAnalysis(host); };
-    window.addEventListener("resize", () => { if (chart) setTimeout(() => chart.resize(), 120); });
-    window.addEventListener("orientationchange", () => { if (chart) setTimeout(() => chart.resize(), 260); });
+    window.addEventListener("resize", () => { setTimeout(() => { if (chart) chart.resize(); if (trafficChart) trafficChart.resize(); }, 120); });
+    window.addEventListener("orientationchange", () => { setTimeout(() => { if (chart) chart.resize(); if (trafficChart) trafficChart.resize(); }, 260); });
     init().catch(err => { $("aiResult").textContent = err.message; });
   </script>
 </body>
@@ -1549,6 +1610,10 @@ const ADMIN_PANEL_HTML = `<!doctype html>
     .msg { color:var(--muted); white-space:pre-wrap; overflow-wrap:anywhere; }
     .error { color:var(--bad); }
     .account small, .account strong { overflow-wrap:anywhere; word-break:break-word; }
+    .modal-mask { position:fixed; inset:0; display:none; place-items:center; padding:18px; background:rgba(3,7,18,.72); z-index:50; }
+    .modal-mask.open { display:grid; }
+    .modal-card { width:min(420px,100%); background:var(--panel); border:1px solid var(--line); border-radius:22px; padding:20px; box-shadow:0 30px 90px rgba(0,0,0,.45); }
+    .modal-card code { display:block; margin:12px 0; padding:12px; border-radius:13px; color:var(--accent); background:#0d172b; overflow-wrap:anywhere; }
     @media (max-width:800px) { header { flex-direction:column; align-items:flex-start; } header > .row { margin-left:0; justify-content:flex-start; } }
     @media (max-width:520px) { header, main { width:min(1120px, calc(100vw - 20px)); } .panel { padding:14px; border-radius:18px; } button, .secondary { width:100%; text-align:center; } }
   </style>
@@ -1585,8 +1650,17 @@ const ADMIN_PANEL_HTML = `<!doctype html>
       <div id="privacyMsg" class="msg"></div>
     </section>
   </main>
+  <div id="deleteConfirmMask" class="modal-mask">
+    <div class="modal-card">
+      <h2>确认删除账号</h2>
+      <p>删除后需要重新添加账号配置。确认删除以下账号？</p>
+      <code id="deleteConfirmName"></code>
+      <div class="row"><button id="deleteConfirmYes" class="danger" type="button">确认删除</button><button id="deleteConfirmNo" class="secondary" type="button">取消</button></div>
+    </div>
+  </div>
   <script>
     const $ = (id) => document.getElementById(id);
+    let pendingDeleteId = "";
     async function api(path, options = {}) {
       const res = await fetch(path, { headers: { "Content-Type": "application/json", ...(options.headers || {}) }, ...options });
       const contentType = res.headers.get("content-type") || "";
@@ -1622,12 +1696,15 @@ const ADMIN_PANEL_HTML = `<!doctype html>
       });
       document.querySelectorAll("button[data-id]").forEach((button) => {
         button.addEventListener("click", async () => {
-          if (!confirm("确定删除这个账号？")) return;
-          await api("/api/accounts?id=" + encodeURIComponent(button.dataset.id), { method: "DELETE" });
-          await loadAccounts();
+          pendingDeleteId = button.dataset.id;
+          const wrap = document.querySelector('[data-account="' + pendingDeleteId + '"]');
+          const name = wrap?.querySelector("input[data-account-name]")?.value || "未命名账号";
+          $("deleteConfirmName").textContent = name;
+          $("deleteConfirmMask").classList.add("open");
         });
       });
     }
+    function closeDeleteConfirm() { pendingDeleteId = ""; $("deleteConfirmMask").classList.remove("open"); }
     async function loadPrivacy() {
       const data = await api("/api/privacy");
       for (const key of ["publicTopIPs", "publicTopHosts", "publicTimeline", "publicFilters", "hideAiPanel", "aiVerboseData"]) $(key).checked = Boolean(data.privacy[key]);
@@ -1665,6 +1742,14 @@ const ADMIN_PANEL_HTML = `<!doctype html>
     $("logoutBtn").addEventListener("click", async () => {
       await api("/api/logout", { method: "POST" });
       location.href = "/login";
+    });
+    $("deleteConfirmNo").addEventListener("click", closeDeleteConfirm);
+    $("deleteConfirmMask").addEventListener("click", (event) => { if (event.target === $("deleteConfirmMask")) closeDeleteConfirm(); });
+    $("deleteConfirmYes").addEventListener("click", async () => {
+      if (!pendingDeleteId) return;
+      await api("/api/accounts?id=" + encodeURIComponent(pendingDeleteId), { method: "DELETE" });
+      closeDeleteConfirm();
+      await loadAccounts();
     });
     Promise.all([loadAccounts(), loadPrivacy()]).catch((error) => {
       $("accounts").textContent = error.message;

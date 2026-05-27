@@ -2,6 +2,8 @@
 
 Cloudflare 多账号请求分析面板，支持按账号、区域、域名、子域名、Worker 服务名和时间范围筛选数据，查看 HTTP 请求、Workers / Pages 用量、流量趋势、Top IP / Top Host，并通过 Workers AI 分析服务入口的异常风险。
 
+[在线 Demo](https://cf-analytics-demo.cce.de5.net/)
+
 ## 功能
 
 - 多账号请求汇总与单账号查看
