@@ -20,14 +20,14 @@ export default {
         if (!(await isAdmin(request, env))) return redirect("/login");
         return html(ADMIN_PANEL_HTML);
       }
-      if (url.pathname === "/api/session") return sessionRoute(request, env);
-      if (url.pathname === "/api/login" && request.method === "POST") return login(request, env);
+      if (url.pathname === "/api/session") return await sessionRoute(request, env);
+      if (url.pathname === "/api/login" && request.method === "POST") return await login(request, env);
       if (url.pathname === "/api/logout" && request.method === "POST") return logout();
-      if (url.pathname === "/api/accounts") return accountsRoute(request, env);
-      if (url.pathname === "/api/privacy") return privacyRoute(request, env);
-      if (url.pathname === "/usage.json" || url.pathname === "/api/usage") return usageRoute(request, env);
-      if (url.pathname === "/api/analytics") return analyticsRoute(request, env);
-      if (url.pathname === "/api/ai/analyze" && request.method === "POST") return aiRoute(request, env);
+      if (url.pathname === "/api/accounts") return await accountsRoute(request, env);
+      if (url.pathname === "/api/privacy") return await privacyRoute(request, env);
+      if (url.pathname === "/usage.json" || url.pathname === "/api/usage") return await usageRoute(request, env);
+      if (url.pathname === "/api/analytics") return await analyticsRoute(request, env);
+      if (url.pathname === "/api/ai/analyze" && request.method === "POST") return await aiRoute(request, env);
       if (url.pathname === "/robots.txt") return text("User-agent: *\nDisallow: /\n");
       return json({ error: "not_found" }, 404);
     } catch (error) {
@@ -633,7 +633,7 @@ async function cfGraphql(token, query, variables) {
     body: JSON.stringify({ query, variables }),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data?.errors?.[0]?.message || `Cloudflare GraphQL ${res.status}`);
+  if (!res.ok) throw new Error((data?.errors?.[0]?.message || "Cloudflare GraphQL 请求失败：" + res.status) + "，请检查 Token 是否有效");
   return data;
 }
 
@@ -1023,15 +1023,25 @@ async function validateAccountConfig(input) {
   const token = String(input.token || "").trim();
   const accountId = String(input.accountId || "").trim();
   const zoneIds = zones.map((zone) => String(zone.zoneTag || "").trim()).filter(Boolean);
-  if (!input.name || !token || (!zoneIds.length && !accountId)) throw new Error("name_token_account_or_zones_required");
+  if (!input.name || !token || (!zoneIds.length && !accountId)) throw new Error("请填写名称、Token，并至少填写 Account ID 或一个区域");
+  if (accountId) await validateAccountId(token, accountId);
+  if (!zoneIds.length) return;
   const query = "query ValidateZone($zoneTag: string, $filter: filter) { viewer { zones(filter: { zoneTag: $zoneTag }) { totals: httpRequestsAdaptiveGroups(limit: 1, filter: $filter) { count } } } }";
   const now = new Date();
   const then = new Date(now.getTime() - 60 * 60 * 1000);
   const filter = { datetime_geq: then.toISOString().replace(/\.\d{3}Z$/, "Z"), datetime_lt: now.toISOString().replace(/\.\d{3}Z$/, "Z"), requestSource: "eyeball" };
   for (const zoneTag of zoneIds) {
     const result = await cfGraphql(token, query, { zoneTag, filter });
-    if (!result.data?.viewer?.zones?.length) throw new Error("zone_validation_failed");
+    if (!result.data?.viewer?.zones?.length) throw new Error("区域 ID 无效：" + zoneTag + " 在 Cloudflare 中不存在或 Token 无权限访问");
   }
+}
+
+async function validateAccountId(token, accountId) {
+  if (!accountId) return;
+  const query = "query ValidateAccount($accountTag: string) { viewer { accounts(filter: { accountTag: $accountTag }) { ... on Account { accountTag } } } }";
+  const result = await cfGraphql(token, query, { accountTag: accountId });
+  const accounts = result.data?.viewer?.accounts || [];
+  if (!accounts.length) throw new Error("Account ID 无效：" + accountId + " 在 Cloudflare 中不存在或 Token 无权限访问");
 }
 
 async function readAccounts(env) {
@@ -1076,7 +1086,7 @@ async function normalizeAccount(input, env) {
   const zones = Array.isArray(input.zones) ? input.zones : [];
   const normalizedZones = zones.map((zone) => ({ id: crypto.randomUUID(), zoneTag: String(zone.zoneTag || "").trim(), name: String(zone.name || "").trim() || "未命名区域" })).filter((zone) => zone.zoneTag);
   const accountId = String(input.accountId || "").trim();
-  if (!input.name || !input.token || (!normalizedZones.length && !accountId)) throw new Error("name_token_account_or_zones_required");
+  if (!input.name || !input.token || (!normalizedZones.length && !accountId)) throw new Error("请填写名称、Token，并至少填写 Account ID 或一个区域");
   const id = crypto.randomUUID();
   const key = await deriveKey(env);
   const ciphertext = await encryptJson(key, { token: String(input.token).trim(), accountId, zones: normalizedZones });
@@ -1150,13 +1160,22 @@ function mergeZones(existing, incoming) {
 async function updateAccountLabels(accounts, input, env) {
   const id = String(input.id || "");
   const index = accounts.findIndex((account) => account.id === id);
-  if (index === -1) throw new Error("account_not_found");
+  if (index === -1) throw new Error("账号未找到");
   const key = await deriveKey(env);
   const account = accounts[index];
   const data = await decryptJson(key, account.ciphertext);
+  if (input.accountId !== undefined) {
+    const accountId = String(input.accountId).trim();
+    if (accountId && data.token) await validateAccountId(data.token, accountId);
+    data.accountId = accountId;
+  }
+  if (input.token !== undefined) {
+    const token = String(input.token).trim();
+    if (token && data.accountId) await validateAccountId(token, data.accountId);
+    data.token = token || data.token;
+  }
   const zoneNames = new Map((input.zones || []).map((zone) => [String(zone.id || ""), String(zone.name || "").trim()]));
   data.zones = (data.zones || []).map((zone) => ({ ...zone, name: zoneNames.get(zone.id) || zone.name || "未命名区域" }));
-  if (input.accountId !== undefined) data.accountId = String(input.accountId).trim();
   const updated = {
     ...account,
     name: String(input.name || "").trim() || account.name,
@@ -1170,12 +1189,21 @@ async function updateAccountLabels(accounts, input, env) {
 async function addAccountZones(accounts, input, env) {
   const id = String(input.id || "");
   const index = accounts.findIndex((account) => account.id === id);
-  if (index === -1) throw new Error("account_not_found");
+  if (index === -1) throw new Error("账号未找到");
   const newZones = (input.zones || []).map((zone) => ({ id: crypto.randomUUID(), zoneTag: String(zone.zoneTag || "").trim(), name: String(zone.name || "").trim() || "未命名区域" })).filter((zone) => zone.zoneTag);
-  if (!newZones.length) throw new Error("no_valid_zones");
+  if (!newZones.length) throw new Error("未提供有效的区域 ID");
   const key = await deriveKey(env);
   const account = accounts[index];
   const data = await decryptJson(key, account.ciphertext);
+  if (!data.token) throw new Error("该账号未配置 Token，无法验证区域");
+  const query = "query ValidateZone($zoneTag: string, $filter: filter) { viewer { zones(filter: { zoneTag: $zoneTag }) { totals: httpRequestsAdaptiveGroups(limit: 1, filter: $filter) { count } } } }";
+  const now = new Date();
+  const then = new Date(now.getTime() - 60 * 60 * 1000);
+  const filter = { datetime_geq: then.toISOString().replace(/\.\d{3}Z$/, "Z"), datetime_lt: now.toISOString().replace(/\.\d{3}Z$/, "Z"), requestSource: "eyeball" };
+  for (const zone of newZones) {
+    const result = await cfGraphql(data.token, query, { zoneTag: zone.zoneTag, filter });
+    if (!result.data?.viewer?.zones?.length) throw new Error("区域 ID 无效：" + zone.zoneTag + " 在 Cloudflare 中不存在或 Token 无权限访问");
+  }
   const byTag = new Map((data.zones || []).map((z) => [z.zoneTag, z]));
   for (const zone of newZones) if (!byTag.has(zone.zoneTag)) { data.zones.push(zone); byTag.set(zone.zoneTag, zone); }
   const updated = { ...account, ciphertext: await encryptJson(key, data) };
@@ -1186,7 +1214,7 @@ async function addAccountZones(accounts, input, env) {
 
 async function removeAccountZone(accounts, accountId, zoneId, env) {
   const index = accounts.findIndex((account) => account.id === accountId);
-  if (index === -1) throw new Error("account_not_found");
+  if (index === -1) throw new Error("账号未找到");
   const key = await deriveKey(env);
   const account = accounts[index];
   const data = await decryptJson(key, account.ciphertext);
@@ -1213,7 +1241,7 @@ async function encryptJson(key, value) {
 
 async function decryptJson(key, encoded) {
   const [ivPart, dataPart] = String(encoded || "").split(".");
-  if (!ivPart || !dataPart) throw new Error("invalid_ciphertext");
+  if (!ivPart || !dataPart) throw new Error("账号加密数据格式异常，请删除后重新添加");
   const iv = fromB64(ivPart);
   const data = fromB64(dataPart);
   const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, data);
@@ -1242,7 +1270,7 @@ async function readPrivacy(env) {
 }
 
 async function writePrivacy(env, privacy) {
-  if (!env.KV) throw new Error("missing_KV_binding");
+  if (!env.KV) throw new Error("未绑定 KV namespace，请在 Pages Functions 设置中添加 KV 绑定");
   await env.KV.put(PRIVACY_KEY, JSON.stringify(privacy));
 }
 
@@ -1297,7 +1325,7 @@ function redactForPublic(body, privacy) {
 }
 
 async function writeAccounts(env, accounts) {
-  if (!env.KV) throw new Error("missing_KV_binding");
+  if (!env.KV) throw new Error("未绑定 KV namespace，请在 Pages Functions 设置中添加 KV 绑定");
   await env.KV.put(CONFIG_KEY, JSON.stringify(accounts));
 }
 
@@ -1737,16 +1765,44 @@ const ADMIN_PANEL_HTML = `<!doctype html>
       <h2>确认删除账号</h2>
       <p>删除后需要重新添加账号配置。确认删除以下账号？</p>
       <code id="deleteConfirmName"></code>
+      <div class="msg" id="deleteConfirmMsg"></div>
       <div class="row"><button id="deleteConfirmYes" class="danger" type="button">确认删除</button><button id="deleteConfirmNo" class="secondary" type="button">取消</button></div>
+    </div>
+  </div>
+  <div id="deleteZoneMask" class="modal-mask">
+    <div class="modal-card">
+      <h2>确认删除区域</h2>
+      <p>删除后需要重新添加区域配置。确认删除以下区域？</p>
+      <code id="deleteZoneName"></code>
+      <div class="msg" id="deleteZoneMsg"></div>
+      <div class="row"><button id="deleteZoneYes" class="danger" type="button">确认删除</button><button id="deleteZoneNo" class="secondary" type="button">取消</button></div>
+    </div>
+  </div>
+  <div id="modifyTokenMask" class="modal-mask">
+    <div class="modal-card" style="display:grid;gap:12px">
+      <h2>修改 Token / Account ID</h2>
+      <p>留空表示不修改，填写后将验证并保存。</p>
+      <label><div style="color:var(--muted);margin-bottom:4px">Cloudflare API Token</div><input id="modifyTokenInput" placeholder="留空则不修改" style="width:100%"></label>
+      <label><div style="color:var(--muted);margin-bottom:4px">Cloudflare Account ID</div><input id="modifyAccountIdInput" placeholder="留空则不修改" style="width:100%"></label>
+      <div class="msg" id="modifyTokenMsg"></div>
+      <div class="row"><button id="modifyTokenSave" type="button">保存</button><button id="modifyTokenCancel" class="secondary" type="button">取消</button></div>
     </div>
   </div>
   <script>
     const $ = (id) => document.getElementById(id);
     let pendingDeleteId = "";
+    let pendingDeleteZone = null;
+    let pendingModifyId = "";
     async function api(path, options = {}) {
       const res = await fetch(path, { headers: { "Content-Type": "application/json", ...(options.headers || {}) }, ...options });
       const contentType = res.headers.get("content-type") || "";
-      const data = contentType.includes("application/json") ? await res.json() : { error: await res.text() };
+      let data;
+      if (contentType.includes("application/json")) {
+        data = await res.json();
+      } else {
+        const text = await res.text();
+        data = { error: text.length > 200 ? "服务器返回异常，请检查控制台日志" : text };
+      }
       if (!res.ok) throw new Error(data.message || data.error || "请求失败");
       return data;
     }
@@ -1767,16 +1823,24 @@ const ADMIN_PANEL_HTML = `<!doctype html>
         $("accounts").textContent = "暂无账号";
         return;
       }
-      $("accounts").innerHTML = data.accounts.map((account, ai) => '<div class="panel" data-account="' + escapeHtml(account.id) + '" style="display:grid;gap:12px;width:100%;border:1px solid var(--line);border-radius:22px;padding:20px;background:var(--panel)"><label><span style="color:var(--muted)">#' + (ai + 1) + ' 账号显示名称</span><input data-account-name value="' + escapeHtml(account.name) + '" style="margin-top:4px"></label><small>' + escapeHtml(account.createdAt || "") + (account.hasAccountId ? ' · 已配置 Account ID' : ' · 未配置 Account ID') + '</small>' + (account.zones || []).map((zone, zi) => '<div' + (zi ? ' style="border-top:1px solid var(--line);padding-top:8px;margin-top:4px"' : '') + '><div style="display:grid;gap:6px"><span style="color:var(--muted)">区域 ' + (zi + 1) + '</span><input data-zone-id="' + escapeHtml(zone.id) + '" value="' + escapeHtml(zone.name) + '"><button type="button" data-delete-zone="' + escapeHtml(account.id) + '|' + escapeHtml(zone.id) + '" class="secondary" style="width:100%">删除区域</button></div></div>').join("") + '<div style="background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:14px;display:grid;gap:10px;width:100%">' + (account.hasAccountId ? '' : '<label><div style="color:var(--muted);margin-bottom:4px">Cloudflare Account ID</div><input data-account-id value=""></label><button type="button" data-save-account-id="' + escapeHtml(account.id) + '" class="secondary">保存 Account ID</button>') + '<label><div style="color:var(--muted);margin-bottom:4px">添加区域</div><input data-add-zone placeholder="区域 ID 或 ZoneID#名称"></label><button type="button" data-add-zones-id="' + escapeHtml(account.id) + '" class="secondary">添加区域</button></div><div class="row" style="width:100%;flex-direction:column"><button class="secondary" type="button" data-save-id="' + escapeHtml(account.id) + '" style="width:100%">保存名称</button><button class="danger" type="button" data-id="' + escapeHtml(account.id) + '" style="width:100%">删除</button></div></div>').join("");
+      $("accounts").innerHTML = data.accounts.map((account, ai) => '<div class="panel" data-account="' + escapeHtml(account.id) + '" style="display:grid;gap:12px;width:100%;border:1px solid var(--line);border-radius:22px;padding:20px;background:var(--panel)"><label><span style="color:var(--muted)">#' + (ai + 1) + ' 账号显示名称</span><input data-account-name value="' + escapeHtml(account.name) + '" style="margin-top:4px"></label><small>' + escapeHtml(account.createdAt || "") + (account.hasAccountId ? ' · 已配置 Account ID' : ' · 未配置 Account ID') + '</small>' + (account.zones || []).map((zone, zi) => '<div' + (zi ? ' style="border-top:1px solid var(--line);padding-top:8px;margin-top:4px"' : '') + '><div style="display:grid;gap:6px"><span style="color:var(--muted)">区域 ' + (zi + 1) + '</span><input data-zone-id="' + escapeHtml(zone.id) + '" value="' + escapeHtml(zone.name) + '"><button type="button" data-delete-zone-btn="' + escapeHtml(account.id) + '|' + escapeHtml(zone.id) + '" class="secondary" style="width:100%">删除区域</button></div></div>').join("") + '<div style="background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:14px;display:grid;gap:10px;width:100%">' + (account.hasAccountId ? '' : '<label><div style="color:var(--muted);margin-bottom:4px">Cloudflare Account ID</div><input data-account-id value=""></label><button type="button" data-save-account-id="' + escapeHtml(account.id) + '" class="secondary">保存 Account ID</button>') + '<label><div style="color:var(--muted);margin-bottom:4px">添加区域</div><input data-add-zone placeholder="区域 ID 或 ZoneID#名称"></label><button type="button" data-add-zones-id="' + escapeHtml(account.id) + '" class="secondary">添加区域</button><div class="msg" style="grid-column:1/-1;min-height:0" data-account-msg="' + escapeHtml(account.id) + '"></div></div><div class="row" style="width:100%;flex-direction:column;gap:8px"><button class="secondary" type="button" data-modify-token="' + escapeHtml(account.id) + '" style="width:100%">修改 Token / Account ID</button><button class="secondary" type="button" data-save-id="' + escapeHtml(account.id) + '" style="width:100%">保存名称</button><button class="danger" type="button" data-id="' + escapeHtml(account.id) + '" style="width:100%">删除</button></div></div>').join("");
       document.querySelectorAll("button[data-save-id]").forEach((button) => {
         button.addEventListener("click", async () => {
           const wrap = document.querySelector('[data-account="' + button.dataset.saveId + '"]');
           const zones = [...wrap.querySelectorAll("input[data-zone-id]")].map((input) => ({ id: input.dataset.zoneId, name: input.value.trim() }));
-          const accountIdInput = wrap.querySelector("input[data-account-id]");
-          const body = { id: button.dataset.saveId, name: wrap.querySelector("input[data-account-name]").value.trim(), zones };
-          if (accountIdInput) body.accountId = accountIdInput.value.trim();
-          await api("/api/accounts", { method: "PUT", body: JSON.stringify(body) });
-          await loadAccounts();
+          await api("/api/accounts", { method: "PUT", body: JSON.stringify({ id: button.dataset.saveId, name: wrap.querySelector("input[data-account-name]").value.trim(), zones }) });
+          showAccountSuccess(button.dataset.saveId, "保存成功");
+          setTimeout(() => loadAccounts(), 800);
+        });
+      });
+      document.querySelectorAll("button[data-modify-token]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          pendingModifyId = button.dataset.modifyToken;
+          $("modifyTokenInput").value = "";
+          $("modifyAccountIdInput").value = "";
+          $("modifyTokenMsg").textContent = "";
+          $("modifyTokenMsg").classList.remove("error");
+          $("modifyTokenMask").classList.add("open");
         });
       });
       document.querySelectorAll("button[data-id]").forEach((button) => {
@@ -1785,6 +1849,8 @@ const ADMIN_PANEL_HTML = `<!doctype html>
           const wrap = document.querySelector('[data-account="' + pendingDeleteId + '"]');
           const name = wrap?.querySelector("input[data-account-name]")?.value || "未命名账号";
           $("deleteConfirmName").textContent = name;
+          $("deleteConfirmMsg").textContent = "";
+          $("deleteConfirmMsg").classList.remove("error");
           $("deleteConfirmMask").classList.add("open");
         });
       });
@@ -1800,20 +1866,25 @@ const ADMIN_PANEL_HTML = `<!doctype html>
           const name = parts.join("#").trim() || "未命名区域";
           if (!zoneTag) return;
           try {
+            showAccountError(button.dataset.addZonesId, "");
             await api("/api/accounts", { method: "PATCH", body: JSON.stringify({ id: button.dataset.addZonesId, zones: [{ zoneTag, name }] }) });
             input.value = "";
-            await loadAccounts();
-          } catch (error) { alert(error.message); }
+            showAccountSuccess(button.dataset.addZonesId, "添加成功");
+            setTimeout(() => loadAccounts(), 800);
+          } catch (error) { showAccountError(button.dataset.addZonesId, error.message); }
         });
       });
-      document.querySelectorAll("button[data-delete-zone]").forEach((button) => {
+      document.querySelectorAll("button[data-delete-zone-btn]").forEach((button) => {
         button.addEventListener("click", async () => {
-          const [accountId, zoneId] = button.dataset.deleteZone.split("|");
+          const [accountId, zoneId] = button.dataset.deleteZoneBtn.split("|");
           if (!accountId || !zoneId) return;
-          try {
-            await api("/api/accounts?id=" + encodeURIComponent(accountId) + "&zoneId=" + encodeURIComponent(zoneId), { method: "DELETE" });
-            await loadAccounts();
-          } catch (error) { alert(error.message); }
+          const wrap = document.querySelector('[data-account="' + accountId + '"]');
+          const zoneName = wrap?.querySelector('[data-zone-id="' + zoneId + '"]')?.value || zoneId;
+          $("deleteZoneName").textContent = zoneName;
+          $("deleteZoneMsg").textContent = "";
+          $("deleteZoneMsg").classList.remove("error");
+          pendingDeleteZone = { accountId, zoneId };
+          $("deleteZoneMask").classList.add("open");
         });
       });
       document.querySelectorAll("button[data-save-account-id]").forEach((button) => {
@@ -1824,11 +1895,21 @@ const ADMIN_PANEL_HTML = `<!doctype html>
           const val = input.value.trim();
           if (!val) return;
           try {
+            showAccountError(button.dataset.saveAccountId, "");
             await api("/api/accounts", { method: "PUT", body: JSON.stringify({ id: button.dataset.saveAccountId, accountId: val }) });
-            await loadAccounts();
-          } catch (error) { alert(error.message); }
+            showAccountSuccess(button.dataset.saveAccountId, "保存成功");
+            setTimeout(() => loadAccounts(), 800);
+          } catch (error) { showAccountError(button.dataset.saveAccountId, error.message); }
         });
       });
+    }
+    function showAccountError(id, msg) {
+      const el = document.querySelector('[data-account-msg="' + id + '"]');
+      if (el) { el.textContent = msg; el.classList.add("error"); }
+    }
+    function showAccountSuccess(id, msg) {
+      const el = document.querySelector('[data-account-msg="' + id + '"]');
+      if (el) { el.textContent = msg; el.classList.remove("error"); }
     }
     function closeDeleteConfirm() { pendingDeleteId = ""; $("deleteConfirmMask").classList.remove("open"); }
     async function loadPrivacy() {
@@ -1873,9 +1954,56 @@ const ADMIN_PANEL_HTML = `<!doctype html>
     $("deleteConfirmMask").addEventListener("click", (event) => { if (event.target === $("deleteConfirmMask")) closeDeleteConfirm(); });
     $("deleteConfirmYes").addEventListener("click", async () => {
       if (!pendingDeleteId) return;
-      await api("/api/accounts?id=" + encodeURIComponent(pendingDeleteId), { method: "DELETE" });
-      closeDeleteConfirm();
-      await loadAccounts();
+      const msg = $("deleteConfirmMsg");
+      msg.classList.remove("error");
+      msg.textContent = "正在删除...";
+      try {
+        await api("/api/accounts?id=" + encodeURIComponent(pendingDeleteId), { method: "DELETE" });
+        msg.textContent = "删除成功";
+        msg.classList.remove("error");
+        setTimeout(() => { closeDeleteConfirm(); loadAccounts(); }, 800);
+      } catch (error) {
+        msg.classList.add("error");
+        msg.textContent = error.message;
+      }
+    });
+    function closeDeleteZoneConfirm() { pendingDeleteZone = null; $("deleteZoneMask").classList.remove("open"); }
+    $("deleteZoneNo").addEventListener("click", closeDeleteZoneConfirm);
+    $("deleteZoneMask").addEventListener("click", (event) => { if (event.target === $("deleteZoneMask")) closeDeleteZoneConfirm(); });
+    $("deleteZoneYes").addEventListener("click", async () => {
+      if (!pendingDeleteZone) return;
+      const msg = $("deleteZoneMsg");
+      msg.classList.remove("error");
+      msg.textContent = "正在删除...";
+      try {
+        await api("/api/accounts?id=" + encodeURIComponent(pendingDeleteZone.accountId) + "&zoneId=" + encodeURIComponent(pendingDeleteZone.zoneId), { method: "DELETE" });
+        msg.textContent = "删除成功";
+        msg.classList.remove("error");
+        setTimeout(() => { closeDeleteZoneConfirm(); loadAccounts(); }, 800);
+      } catch (error) {
+        msg.classList.add("error");
+        msg.textContent = error.message;
+      }
+    });
+    function closeModifyToken() { pendingModifyId = ""; $("modifyTokenMsg").textContent = ""; $("modifyTokenMsg").classList.remove("error"); $("modifyTokenMask").classList.remove("open"); }
+    $("modifyTokenCancel").addEventListener("click", closeModifyToken);
+    $("modifyTokenMask").addEventListener("click", (event) => { if (event.target === $("modifyTokenMask")) closeModifyToken(); });
+    $("modifyTokenSave").addEventListener("click", async () => {
+      const msg = $("modifyTokenMsg");
+      msg.classList.remove("error");
+      msg.textContent = "保存中...";
+      try {
+        const token = $("modifyTokenInput").value.trim();
+        const accountId = $("modifyAccountIdInput").value.trim();
+        if (!token && !accountId) throw new Error("请至少填写 Token 或 Account ID 其中一项");
+        await api("/api/accounts", { method: "PUT", body: JSON.stringify({ id: pendingModifyId, token: token || undefined, accountId: accountId || undefined }) });
+        msg.textContent = "保存成功";
+        msg.classList.remove("error");
+        setTimeout(() => { closeModifyToken(); loadAccounts(); }, 800);
+      } catch (error) {
+        msg.classList.add("error");
+        msg.textContent = error.message;
+      }
     });
     Promise.all([loadAccounts(), loadPrivacy()]).catch((error) => {
       $("accounts").textContent = error.message;
