@@ -1362,13 +1362,18 @@ function cleanProjectName(value) {
 }
 
 function timeRange(hours) {
-  const end = new Date();
-  const start = new Date(end.getTime() - hours * 60 * 60 * 1000);
+  const stepMs = 60 * 60 * 1000;
+  const end = new Date(ceilTime(Date.now(), stepMs));
+  const start = new Date(end.getTime() - hours * stepMs);
   return { start: start.toISOString().replace(/\.\d{3}Z$/, "Z"), end: end.toISOString().replace(/\.\d{3}Z$/, "Z") };
 }
 
 function floorTime(ms, stepMs) {
   return Math.floor(ms / stepMs) * stepMs;
+}
+
+function ceilTime(ms, stepMs) {
+  return Math.ceil(ms / stepMs) * stepMs;
 }
 
 async function isAdmin(request, env) {
