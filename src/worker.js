@@ -298,7 +298,7 @@ async function loadAccountAnalytics(account, hours, host, includeAiBuckets = fal
         fullTimeline = fillRange(mergeTimelineHours(hist, fresh.timeline), start, end, hours);
       } else {
         fallback = true;
-        fullTimeline = fillRange(fresh.timeline, queryStart, end, hours);
+        fullTimeline = fillRange(fresh.timeline, start, end, hours);
       }
     }
     saveTimeline(env, histHttpKey, zone.zoneTag, fullTimeline);
@@ -388,7 +388,7 @@ async function loadWorkerAccountMetrics(accounts, hours, env = null) {
         fullTimeline = fillRange(merged, start, end, 24);
       } else {
         fallback = true;
-        fullTimeline = fillRange(fresh.timeline, queryStart, end, 24);
+        fullTimeline = fillRange(fresh.timeline, start, end, 24);
       }
     }
     if (!fresh.error) saveTimeline(env, histWorkerKey, account.accountId, fullTimeline);
@@ -733,12 +733,8 @@ function mergeAnalytics(items, hours) {
   const topIPs = new Map();
   const topHosts = new Map();
   const topCountries = new Map();
-  let totalRequests = 0;
-  let totalBytes = 0;
   for (const item of items) {
     const totals = item.totals || item;
-    totalRequests += totals.totalRequests || 0;
-    totalBytes += totals.totalBytes || 0;
     for (const point of totals.timeline || []) {
       const old = points.get(point.time) || { time: point.time, count: 0, bytes: 0 };
       old.count += point.count || 0;
@@ -766,10 +762,13 @@ function mergeAnalytics(items, hours) {
       topCountries.set(country, old);
     }
   }
+  const allPoints = [...points.values()].sort((a, b) => a.time.localeCompare(b.time));
+  const totalRequests = allPoints.reduce((s, p) => s + p.count, 0);
+  const totalBytes = allPoints.reduce((s, p) => s + p.bytes, 0);
   return {
     totalRequests,
     totalBytes,
-    timeline: [...points.values()].sort((a, b) => a.time.localeCompare(b.time)),
+    timeline: allPoints,
     topIPs: [...topIPs.values()].sort((a, b) => b.count - a.count).slice(0, 20),
     topHosts: [...topHosts.values()].sort((a, b) => b.count - a.count).slice(0, 20),
     topCountries: [...topCountries.values()].sort((a, b) => b.count - a.count).slice(0, 80),
@@ -1517,6 +1516,7 @@ function histProjectKey(accountId, project, date) { return `hist:project:${accou
 
 async function saveTimeline(env, keyFn, qualifier, timeline) {
   if (!env?.KV) return;
+  const encKey = await deriveKey(env);
   const byDate = {};
   for (const p of timeline) {
     const t = p.time || p.hour;
@@ -1528,23 +1528,41 @@ async function saveTimeline(env, keyFn, qualifier, timeline) {
   for (const [date, points] of Object.entries(byDate)) {
     const key = keyFn(qualifier, date);
     try {
-      const existing = await env.KV.get(key, "json") || [];
+      const raw = await env.KV.get(key);
+      let existing = [];
+      if (raw) {
+        try {
+          existing = await decryptJson(encKey, raw);
+        } catch {
+          existing = JSON.parse(raw);
+        }
+      }
       const merged = mergeTimelineHours(existing, points);
-      await env.KV.put(key, JSON.stringify(merged), { expirationTtl: 86400 * 35 });
+      await env.KV.put(key, await encryptJson(encKey, merged), { expirationTtl: 86400 * 7 });
     } catch {}
   }
 }
 
 async function loadTimeline(env, keyFn, qualifier, startDate, endDate) {
   if (!env?.KV) return [];
+  const encKey = await deriveKey(env);
   const all = [];
-  let d = new Date(startDate);
   const end = new Date(endDate);
+  end.setDate(end.getDate() + 1);
+  let d = new Date(startDate);
   while (d < end) {
     const key = keyFn(qualifier, d.toISOString().slice(0, 10));
     try {
-      const data = await env.KV.get(key, "json");
-      if (data) all.push(...data);
+      const raw = await env.KV.get(key);
+      if (raw) {
+        let data;
+        try {
+          data = await decryptJson(encKey, raw);
+        } catch {
+          data = JSON.parse(raw);
+        }
+        if (data) all.push(...data);
+      }
     } catch {}
     d.setDate(d.getDate() + 1);
   }
@@ -1764,7 +1782,7 @@ const INDEX_HTML = `<!doctype html>
       <label id="zoneFilter">区域<select id="zoneSelect"><option value="all">全部区域汇总</option></select></label>
       <label id="hostFilter">主机名<input id="hostInput" placeholder="可选：输入要筛选的主机名"></label>
       <label id="projectFilter">服务名 / 项目名<input id="projectInput" placeholder="可选：输入可观测性中的 Service 名称"></label>
-      <label>时间范围<select id="rangeSelect"><option value="168">过去 7 天</option><option value="72">过去 3 天</option><option value="24">过去 24 小时</option><option value="12">过去 12 小时</option><option value="6">过去 6 小时</option><option value="1">过去 1 小时</option></select></label>
+      <label>时间范围<select id="rangeSelect"><option value="24">过去 24 小时</option><option value="12">过去 12 小时</option><option value="6">过去 6 小时</option><option value="1">过去 1 小时</option><option value="72">过去 3 天</option><option value="168">过去 7 天</option></select></label>
       <button id="refreshBtn">应用筛选</button>
     </section>
     <section class="panel" id="aiPanel">
@@ -1848,7 +1866,7 @@ const INDEX_HTML = `<!doctype html>
     function loadZones() { const accountId = $("accountSelect").value; const accounts = accountId === "all" ? accountCache : accountCache.filter(a => a.id === accountId); const zones = accounts.flatMap(a => (a.zones || []).map(z => ({ id:z.id, name:(accountId === "all" ? a.name + " / " : "") + (z.name || "未命名区域") }))); $("zoneSelect").innerHTML = '<option value="all">全部区域汇总</option>' + zones.map(z => '<option value="' + escapeHtml(z.id) + '">' + escapeHtml(z.name) + '</option>').join(""); }
     function emptyDashboardSummary() { return { totalRequests:0, totalBytes:0, timeline:[], topIPs:[], topHosts:[], topCountries:[] }; }
     function selectedScopeText() { const account = $("accountSelect").options[$("accountSelect").selectedIndex]?.textContent || "全部账号汇总"; const zone = $("zoneSelect").options[$("zoneSelect").selectedIndex]?.textContent || "全部区域汇总"; return account + " / " + zone; }
-    async function refresh() { const q = new URLSearchParams({ account: $("accountSelect").value, zone: $("zoneSelect").value, hours: $("rangeSelect").value, host: $("hostInput").value.trim(), projectName: $("projectInput").value.trim() }); try { const data = await api("/api/analytics?" + q); if (data.fallbackTo24h) { for (const v of ["72", "168"]) { const opt = $("rangeSelect").querySelector('option[value="' + v + '"]'); if (opt) opt.disabled = true; } if (["72", "168"].includes($("rangeSelect").value)) $("rangeSelect").value = "24"; } else { for (const v of ["72", "168"]) { const opt = $("rangeSelect").querySelector('option[value="' + v + '"]'); if (opt) opt.disabled = false; } } render(data.summary, data.hours, data.usage, data.analyticsAvailable !== false, data.projectMetrics, data.workerMetrics); } catch (err) { if (err.code === "no_account") { render(emptyDashboardSummary(), $("rangeSelect").value, { workers:0, pages:0, total:0, limit:0 }, false, null, null); $("analysisBlocked").textContent = err.message; return; } throw err; } }
+    async function refresh() { const q = new URLSearchParams({ account: $("accountSelect").value, zone: $("zoneSelect").value, hours: $("rangeSelect").value, host: $("hostInput").value.trim(), projectName: $("projectInput").value.trim() }); try { const data = await api("/api/analytics?" + q); render(data.summary, data.hours, data.usage, data.analyticsAvailable !== false, data.projectMetrics, data.workerMetrics); } catch (err) { if (err.code === "no_account") { render(emptyDashboardSummary(), $("rangeSelect").value, { workers:0, pages:0, total:0, limit:0 }, false, null, null); $("analysisBlocked").textContent = err.message; return; } throw err; } }
     function shortBeijingTime(value) { const text = String(value || "").replace("T", " "); const match = text.match(/^(?:[0-9]{4}-)?([0-9]{2}-[0-9]{2})[ ]+([0-9]{2}:[0-9]{2})/); return match ? match[1] + " " + match[2] : text.replace(/^[0-9]{4}-/, "").replace(/:[0-9]{2}(?:[ ]+GMT[+]8|Z)?$/, ""); }
     function formatRangeText(hours) { if (hours % 24 === 0) return hours / 24 + " 天"; return hours + "h"; }
     function percentText(count, total) { if (!total) return "0.0%"; const pct = count / total * 100; return pct < 0.1 ? "＜0.1%" : pct.toFixed(pct >= 10 ? 0 : 1) + "%"; }
@@ -1875,6 +1893,7 @@ const INDEX_HTML = `<!doctype html>
     $("requestChartSource").onchange = renderCharts;
     $("accountSelect").onchange = () => { loadZones(); refresh(); };
     $("zoneSelect").onchange = refresh;
+    $("rangeSelect").onchange = refresh;
     function openAiConfirm(host) { pendingAiHost = host; const accountText = $("accountSelect").options[$("accountSelect").selectedIndex]?.textContent || ""; const zoneText = $("zoneSelect").options[$("zoneSelect").selectedIndex]?.textContent || "全部区域汇总"; const projectName = $("projectInput").value.trim(); st("aiConfirmAccount", accountText); st("aiConfirmZone", zoneText); st("aiConfirmHost", host); st("aiConfirmProject", projectName); $("aiConfirmMask").classList.add("open"); }
     function closeAiConfirm() { $("aiConfirmMask").classList.remove("open"); pendingAiHost = ""; }
     async function runAiAnalysis(host) { const btn = $("aiBtn"); const projectName = $("projectInput").value.trim(); const hours = $("rangeSelect").value; btn.disabled = true; btn.textContent = "分析中..."; st("aiResult", "正在校验服务名 / 项目名数据..."); try { const q = new URLSearchParams({ account: $("accountSelect").value, zone: $("zoneSelect").value, hours, host, projectName }); const checked = await api("/api/analytics?" + q); render(checked.summary, checked.hours, checked.usage, checked.analyticsAvailable !== false, checked.projectMetrics, checked.workerMetrics); if (!checked.projectMetrics || !checked.projectMetrics.matched) throw new Error("服务名 / 项目名参数错误，无法成功获取该服务的项目级 Workers metrics 数据。"); st("aiResult", "AI 正在分析..."); const data = await api("/api/ai/analyze", { method:"POST", body: JSON.stringify({ account: $("accountSelect").value, zone: $("zoneSelect").value, hours, host, projectName }) }); const el = $("aiResult"); if (el) el.innerHTML = renderMarkdown(data.analysis); } catch (err) { st("aiResult", err.message); } finally { if (btn) { btn.disabled = false; btn.textContent = "AI 分析"; } } }
